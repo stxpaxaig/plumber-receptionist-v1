@@ -2,12 +2,14 @@ import hmac
 import logging
 import os
 import threading
+import xml.sax.saxutils
 
 from flask import Flask, abort, jsonify, request
 from openai import InvalidWebhookSignatureError, OpenAI
 
 from receptionist import CallController, extract_phone_number
 from storage import LeadStore
+from telnyx_provisioner import provision_telnyx
 
 
 def create_app(config=None):
@@ -15,6 +17,7 @@ def create_app(config=None):
     app.config.from_mapping(
         OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", ""),
         OPENAI_WEBHOOK_SECRET=os.getenv("OPENAI_WEBHOOK_SECRET", ""),
+        OPENAI_PROJECT_ID=os.getenv("OPENAI_PROJECT_ID", ""),
         LEADS_ADMIN_TOKEN=os.getenv("LEADS_ADMIN_TOKEN", ""),
         DATABASE_PATH=os.getenv("DATABASE_PATH", "data/leads.sqlite3"),
         COMPANY_NAME=os.getenv("COMPANY_NAME", "Mountain Plumbing"),
@@ -105,6 +108,59 @@ def create_app(config=None):
             abort(404)
         return jsonify(lead)
 
+    @app.post("/webhooks/telnyx")
+    @app.get("/webhooks/telnyx")
+    def telnyx_webhook():
+        """
+        TeXML webhook handler for Telnyx inbound calls.
+        Routes calls to OpenAI SIP endpoint.
+        """
+        project_id = app.config.get("OPENAI_PROJECT_ID", "")
+        if not project_id:
+            app.logger.error("OpenAI project ID not configured for Telnyx routing")
+            return jsonify(error="server_not_configured"), 503
+
+        # XML-escape the project ID to prevent injection
+        sip_uri = f"sip:{xml.sax.saxutils.escape(project_id)}@sip.api.openai.com;transport=tls"
+        texml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial>
+        <Sip>{sip_uri}</Sip>
+    </Dial>
+</Response>"""
+        return texml, 200, {"Content-Type": "application/xml"}
+
+    # Startup provisioning
+    def provision_on_startup():
+        """Provision Telnyx routing on application startup."""
+        public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+        if not public_domain:
+            app.logger.warning("RAILWAY_PUBLIC_DOMAIN not set; skipping Telnyx provisioning")
+            return
+
+        success = provision_telnyx()
+        if not success:
+            app.logger.error("Telnyx provisioning failed; inbound routing will not work")
+            # Re-raise to fail startup visibly (unless running tests)
+            if not app.config.get("TESTING"):
+                raise RuntimeError(
+                    "Telnyx provisioning failed. Check TELNYX_API_KEY, TELNYX_PHONE_NUMBER, "
+                    "and RAILWAY_PUBLIC_DOMAIN."
+                )
+
+    # Run provisioning once in a background thread after the app starts
+    @app.before_request
+    def run_provisioning_once():
+        """One-time provisioning on first request."""
+        if not hasattr(app, "_telnyx_provisioned"):
+            app._telnyx_provisioned = True
+            try:
+                provision_on_startup()
+            except Exception as e:
+                app.logger.error(f"Provisioning error: {e}")
+                if not app.config.get("TESTING"):
+                    raise
+
     return app
 
 
@@ -113,3 +169,4 @@ app = create_app()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
