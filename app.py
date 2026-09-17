@@ -1,4 +1,5 @@
 import hmac
+import hmac
 import logging
 import os
 import threading
@@ -9,7 +10,6 @@ from openai import InvalidWebhookSignatureError, OpenAI
 
 from receptionist import CallController, extract_phone_number
 from storage import LeadStore
-from telnyx_provisioner import provision_telnyx
 
 
 def create_app(config=None):
@@ -122,44 +122,45 @@ def create_app(config=None):
 
         # XML-escape the project ID to prevent injection
         sip_uri = f"sip:{xml.sax.saxutils.escape(project_id)}@sip.api.openai.com;transport=tls"
+        public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+        callback_url = f"https://{public_domain}/webhooks/telnyx/dial-status"
+        escaped_callback_url = xml.sax.saxutils.escape(callback_url, {'"': '&quot;'})
         texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial>
-        <Sip>{sip_uri}</Sip>
+    <Dial action="{escaped_callback_url}" method="POST">
+        <Sip statusCallback="{escaped_callback_url}" statusCallbackMethod="POST" statusCallbackEvent="initiated ringing answered completed">{sip_uri}</Sip>
     </Dial>
 </Response>"""
         return texml, 200, {"Content-Type": "application/xml"}
 
-    # Startup provisioning
-    def provision_on_startup():
-        """Provision Telnyx routing on application startup."""
-        public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-        if not public_domain:
-            app.logger.warning("RAILWAY_PUBLIC_DOMAIN not set; skipping Telnyx provisioning")
-            return
+    @app.post("/webhooks/telnyx/dial-status")
+    @app.get("/webhooks/telnyx/dial-status")
+    def telnyx_dial_status():
+        """Capture TeXML dial results without logging caller phone numbers."""
+        fields = (
+            "CallStatus",
+            "DialCallStatus",
+            "SipResponseCode",
+            "DialSipResponseCode",
+            "ErrorCode",
+            "ErrorMessage",
+            "HangupCause",
+            "HangupSource",
+        )
+        details = {
+            key: request.values.get(key)
+            for key in fields
+            if request.values.get(key) is not None
+        }
+        app.logger.warning("Telnyx SIP dial status: %s", details)
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>',
+            200,
+            {"Content-Type": "application/xml"},
+        )
 
-        success = provision_telnyx()
-        if not success:
-            app.logger.error("Telnyx provisioning failed; inbound routing will not work")
-            # Re-raise to fail startup visibly (unless running tests)
-            if not app.config.get("TESTING"):
-                raise RuntimeError(
-                    "Telnyx provisioning failed. Check TELNYX_API_KEY, TELNYX_PHONE_NUMBER, "
-                    "and RAILWAY_PUBLIC_DOMAIN."
-                )
-
-    # Run provisioning once in a background thread after the app starts
-    @app.before_request
-    def run_provisioning_once():
-        """One-time provisioning on first request."""
-        if not hasattr(app, "_telnyx_provisioned"):
-            app._telnyx_provisioned = True
-            try:
-                provision_on_startup()
-            except Exception as e:
-                app.logger.error(f"Provisioning error: {e}")
-                if not app.config.get("TESTING"):
-                    raise
+    # Carrier routing is managed separately. Never reassign the working
+    # Telnyx number when this application starts or handles a request.
 
     return app
 
