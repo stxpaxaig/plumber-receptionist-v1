@@ -31,7 +31,7 @@ You are the virtual receptionist for {company_name}, a plumbing company. You are
 Begin by clearly saying you are {company_name}'s virtual receptionist and ask how you can help. Determine the reason for the call, then conversationally collect:
 - caller's full name
 - best callback number (the incoming caller ID is {known_number}; ask whether that is the best callback number instead of assuming)
-- complete service address
+- service street address and town; do not separately demand state or ZIP when the location is clear
 - specific plumbing problem
 - urgency: emergency, urgent, routine, or unsure
 
@@ -41,9 +41,12 @@ Hard rules:
 - Never invent or promise pricing, estimates, appointment times, technician availability, arrival times, warranties, or diagnoses.
 - Say a plumber will review the details and contact them; do not claim a booking is confirmed.
 - Ask only one or two short questions at a time.
+- Keep the intake brief. Do not repeat information already supplied. Ask for state only if the town or location is genuinely ambiguous; ZIP is optional.
 - If something is unclear, politely verify it.
 - Before ending, read back the caller's name, callback number, service address, problem, and urgency and ask them to confirm or correct it.
-- Only after the caller confirms, call save_plumbing_lead exactly once with the final corrected information and a concise factual summary.
+- Only after the caller confirms, call save_plumbing_lead with the final corrected information and a concise factual summary. Stop saving after success.
+- If the tool requests corrected arguments, retry once using the already confirmed details, without making the caller repeat the intake.
+- If saving still fails, briefly explain that the details could not be saved. Do not claim dispatch, notification, or successful processing, and do not give a vague refusal of the customer's request.
 - After the tool succeeds, thank the caller, remind them that a plumber will review the request and call them back, and end naturally.
 """.strip()
 
@@ -86,6 +89,7 @@ class CallController:
         self.transcript = []
         self.saved_tool_calls = set()
         self.lead_saved = False
+        self.failed_tool_calls = {}
 
     @property
     def auth_headers(self):
@@ -169,16 +173,9 @@ class CallController:
             "response.audio_transcript.done",
         }:
             self._append_transcript("receptionist", event.get("transcript", ""), event.get("item_id"))
-        elif event_type == "response.function_call_arguments.done":
-            self._handle_tool_call(
-                ws,
-                event.get("name"),
-                event.get("call_id"),
-                event.get("arguments", "{}"),
-            )
         elif event_type == "response.output_item.done":
             item = event.get("item") or {}
-            if item.get("type") == "function_call":
+            if item.get("type") == "function_call" and item.get("status") == "completed":
                 self._handle_tool_call(
                     ws,
                     item.get("name"),
@@ -206,21 +203,36 @@ class CallController:
     def _handle_tool_call(self, ws, name, tool_call_id, arguments):
         if name != "save_plumbing_lead" or not tool_call_id or tool_call_id in self.saved_tool_calls:
             return
-        self.saved_tool_calls.add(tool_call_id)
+        # Ignore repeated malformed payloads, but allow a corrected payload to
+        # succeed. Process only completed output items, never truncated ones.
+        if self.failed_tool_calls.get(tool_call_id) == arguments:
+            return
         try:
             lead = json.loads(arguments)
-            lead_id = self.store.save_lead(
-                call_id=self.call_id,
-                caller_number=self.caller_number,
-                called_number=self.called_number,
-                lead=lead,
-                transcript=self.transcript,
-            )
+            if not isinstance(lead, dict):
+                raise ValueError("Lead arguments must be an object")
+            if self.lead_saved:
+                result = {"success": True, "already_saved": True}
+            else:
+                lead_id = self.store.save_lead(
+                    call_id=self.call_id,
+                    caller_number=self.caller_number,
+                    called_number=self.called_number,
+                    lead=lead,
+                    transcript=self.transcript,
+                )
+                result = {"success": True, "lead_id": lead_id}
             self.lead_saved = True
-            result = {"success": True, "lead_id": lead_id}
+            self.saved_tool_calls.add(tool_call_id)
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
+            LOGGER.warning("Invalid lead arguments for %s", self.call_id)
+            self.failed_tool_calls[tool_call_id] = arguments
+            result = {"success": False, "error": "invalid_lead_arguments", "retryable": True,
+                      "instruction": "Retry once with a complete valid JSON object containing the six required confirmed fields. Do not ask the caller to repeat details."}
         except Exception as exc:
             LOGGER.exception("Unable to save lead for %s", self.call_id)
-            result = {"success": False, "error": "lead_storage_failed"}
+            self.failed_tool_calls[tool_call_id] = arguments
+            result = {"success": False, "error": "lead_storage_failed", "retryable": False}
 
         ws.send(json.dumps({
             "type": "conversation.item.create",
